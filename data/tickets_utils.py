@@ -156,17 +156,17 @@ class modal():
 
     class application():
         
-        class player_role(ui.Modal, title='Заявка на постоянного игрока (Канцелярия)'):
-            age = ui.TextInput(label='Ваш возраст:', style=discord.TextStyle.short)
-            exp = ui.TextInput(label='Сколько уже играете на нашем сервере:', style=discord.TextStyle.short)
-            familiar = ui.TextInput(label='Кто из администрации может знать вас:', style=discord.TextStyle.short)
-            interview = ui.TextInput(label='Время собеседования или гс:', style=discord.TextStyle.short)
+        class player_role(ui.Modal, title='Заявка на становление партнёром проекта'):
+            age = ui.TextInput(label='Ваш проект(ссылка приглашение)', style=discord.TextStyle.short)
+            exp = ui.TextInput(label='Какова цель партнёрки?', style=discord.TextStyle.short)
+            familiar = ui.TextInput(label='Откуда о нас узнали?', style=discord.TextStyle.short)
+            interview = ui.TextInput(label='Есть ли дополнительные просьбы?', style=discord.TextStyle.short)
             async def on_submit(self, interaction: discord.Interaction):
                 thread = await interaction.channel.create_thread(name=f"заявка-номер-{tickets_counter_add()}", auto_archive_duration=10080, invitable=False)
                 ticket_id = int(thread.name.split("-")[-1])
                 open_embed = discord.Embed(title=f"Заявка номер {ticket_id} открыта!", color=config.info)
                 open_embed = interaction_author(open_embed, interaction)
-                ticket_type = discord.Embed(title='Заявка на постоянного игрока', color=config.info)
+                ticket_type = discord.Embed(title='Заявка на становление партнёром проекта', color=config.info)
                 modal_params = discord.Embed(color=config.info)
                 modal_params.add_field(name=self.age.label, value='>>> ' + self.age.value, inline=False)
                 modal_params.add_field(name=self.exp.label, value='>>> ' + self.exp.value, inline=False)
