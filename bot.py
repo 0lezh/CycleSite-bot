@@ -13,9 +13,10 @@ import data.config as config
 from data.emojis import emojis
 from data.ai_utils import api_status, fetch_models, generate_response
 from data.tickets_utils import ticket_launcher, ticket_operator
-from data.logging import debug, info, warning, error
+from data.logging import *
 from colorama import Fore, Back, Style, init
 import data.levelling as levelling
+import data.scp_sync as scp_sync
 
 #Инициализация бота
 intents = discord.Intents.default()
@@ -28,6 +29,7 @@ tree = app_commands.CommandTree(client)
 active_model = 'gpt-3.5-turbo'
 in_voice = {}
 
+
 #Добавление автора к embed
 def interaction_author(embed: discord.Embed, interaction: discord.Interaction):
     embed.set_author(name=interaction.user.name, icon_url=interaction.user.display_avatar)
@@ -36,30 +38,54 @@ def interaction_author(embed: discord.Embed, interaction: discord.Interaction):
 #Пересоздание таблицы
 async def drop_table_confirmed(table, original_intrct, intrct):
     match table:
+        case 'bans':
+            connection = sqlite3.connect(f'data/databases/warns.db')
+            cursor = connection.cursor()
+            cursor.execute(f'DROP TABLE IF EXISTS bans')
+            cursor.execute(f'CREATE TABLE bans (id INTEGER PRIMARY KEY)')
+            embed = discord.Embed(title=f'Баны успешно сброшены!', color=config.info)
+            warning("Таблица банов была сброшена")
+            interaction_author(embed, original_intrct)
+            connection.commit()
+            connection.close()
+
         case 'warns':
             connection = sqlite3.connect(f'data/databases/warns.db')
             cursor = connection.cursor()
             cursor.execute(f'DROP TABLE IF EXISTS warns')
-            cursor.execute(f'CREATE TABLE warns (warn_id INTEGER PRIMARY KEY, name TEXT NOT NULL, reason TEXT, message TEXT, lapse_time INTEGER)')
+            cursor.execute(f'''CREATE TABLE warns (
+                            warn_id INTEGER PRIMARY KEY, 
+                            name TEXT NOT NULL, 
+                            reason TEXT, 
+                            message TEXT, 
+                            lapse_time INTEGER
+                            )''')
             embed = discord.Embed(title=f'Таблица варнов была успешно сброшена!', color=config.info)
             warning("Таблица варнов была сброшена")
             interaction_author(embed, original_intrct)
             connection.commit()
             connection.close()
+            
         case 'levelling':
             connection = sqlite3.connect('data/databases/levelling.db')
             cursor = connection.cursor()
             cursor.execute(f'DROP TABLE IF EXISTS levelling')
-            cursor.execute(f'CREATE TABLE levelling (user_id INTEGER, level INTEGER DEFAULT 1, xp INTEGER DEFAULT 0, voice_time REAL DEFAULT 0, pizza INTEGER DEFAULT 0)')
+            cursor.execute(f'''CREATE TABLE levelling (
+                            user_id INTEGER, 
+                            evel INTEGER DEFAULT 1, 
+                            xp INTEGER DEFAULT 0, 
+                            voice_time REAL DEFAULT 0, 
+                            pizza INTEGER DEFAULT 0, 
+                            user_name TEXT
+                            )''')
             embed = discord.Embed(title=f'Таблица опыта была успешно сброшена!', color=config.info)
             warning("Таблица опыта была сброшена")
             interaction_author(embed, original_intrct)
             connection.commit()
             connection.close()
-
     if not "embed" in locals():
         embed = discord.Embed(title=f'Таблицы не существует, и существовать не должно 😠', color=config.danger)
-    await intrct.response.send_message(embed=embed, ephemeral = True)
+    await intrct.response.send_message(embed=embed)
     await original_intrct.delete_original_response()
 
 #Перевод даты в unix (секунды)
@@ -85,6 +111,16 @@ async def mute(intrct, target, timespan):
     embed = discord.Embed(title=f'Пользователь был замьючен.', description=f'Он сможет снова говорить <t:{unix_datetime(datetime.now().astimezone() + timedelta(seconds=real_timespan))}:R>', color=config.warning)
     await intrct.channel.send(embed = embed)
 
+async def check_ban(member: discord.Member):
+    connection = sqlite3.connect('data/databases/warns.db')
+    cursor = connection.cursor()
+    cursor.execute(f'SELECT * FROM bans WHERE id = ?', (member.id,))
+    result = cursor.fetchone()
+    connection.close()
+    if result:
+        return True
+    else:
+        return False
 
 class drop_confirm(discord.ui.View):
     def __init__(self, table, intrct) -> None:
@@ -120,6 +156,22 @@ async def lapse_of_warns():
     connection.commit()
     connection.close()
 
+@tasks.loop(hours = 24)
+async def update_usernames():
+    connection = sqlite3.connect('data/databases/levelling.db')
+    cursor = connection.cursor()
+
+    cursor.execute("SELECT user_id FROM levelling")
+    ids = cursor.fetchall()
+
+    for row in ids:
+        member = await client.fetch_user(row[0])
+        cursor.execute("UPDATE levelling SET user_name = ? WHERE user_id = ?", (member.display_name, member.id))
+
+    connection.commit()
+    connection.close()
+
+    debug('Обновлены имёна в levelling.db')
 
 #Подгрузка view с тикетами
 @client.event
@@ -133,16 +185,19 @@ async def setup_hook():
 #Запуск циклов и инфо о запуске
 @client.event
 async def on_ready():
+    global guild
+    guild = client.get_guild(config.guild)
     try:
         presence.start()
         lapse_of_warns.start()
-    except RuntimeError:
-        warning('Задача запущенна и не завершена')
+        # update_usernames.start()
+    except RuntimeError as exc:
+        warning('Задача запущенна и не завершена! \n' + exc)
     await tree.sync(guild=discord.Object(id=config.guild))
     info(f'{Fore.CYAN}{client.user.name}{Style.RESET_ALL} подключён к серверу!')
 
 #Пинг бота по slash-комманде
-@tree.command(name="пинг", description="Пингани бота!", guild=discord.Object(id=config.guild))
+@tree.command(name="ping", description="Пингани бота!", guild=discord.Object(id=config.guild))
 async def on_ping(intrct):
     embed = discord.Embed(title="Понг!    ", description=f"{round(client.latency * 1000)}мс", color=config.info)
     await intrct.response.send_message(embed=embed)
@@ -171,13 +226,18 @@ async def on_message(message):
             async with message.channel.typing():
                 response = generate_response(message.content, model=active_model)
                 if type(response) == int:
-                    await message.add_reaction("🚫")
+                    await message.clear_reactions()
+                    await message.add_reaction("⛔")
                     embed = discord.Embed(description=f'**Ошибка {response}**', color=config.danger)
-                    await message.channel.send(embed = embed, delete_after = 15)
+                    await message.channel.send(embed = embed, delete_after = 60)
                 else:
                     await message.channel.send(response)
 
-    await levelling.xp_on_message(message)
+    new_role = await levelling.xp_on_message(message)
+    if new_role:
+        roles_to_remove = [role for role in message.author.roles if role.id in config.levelling_roles]
+        await message.author.remove_roles(*roles_to_remove)
+        await message.author.add_roles(guild.get_role(int(new_role)))
 
 #Выдача и удаление роли Меценат за буст
 @client.event
@@ -192,35 +252,64 @@ async def on_member_update(before, after):
             await after.remove_roles(client.get_guild(int(config.guild)).get_role(1138436827909455925))
 
 @tree.command(name="тикет", description="Запускает систему тикетов в текущей категории!", guild=discord.Object(id=config.guild))
-@app_commands.rename(title='заголовок', description='описание', type='тип')
-@app_commands.describe(title='Заголовок', description='Описание', type='вопросы/баги/жалобы/заявки')
-async def ticketing(intrct, title: str, description: str, type: str):
+@app_commands.rename(type='тип')
+@app_commands.describe(type='вопросы/баги/жалобы/заявки')
+async def ticketing(intrct, type: str):
     match type.lower():
         case 'вопросы':
-            embed = discord.Embed(title=title, description=description, color=config.info)
+            embed = discord.Embed(title="❓ Задайте свой вопрос!", description="Здесь вы можете создать тикет с вашим вопросом, на который ответит администрация сервера!", color=config.info)
             await intrct.channel.send(embed=embed, view=ticket_launcher.question())
             client.add_view(ticket_launcher.question())
         case 'баги':
-            embed = discord.Embed(title=title, description=description, color=config.danger)
+            embed = discord.Embed(title="🐛 Пожаловаться на баг.", description="Здесь можно сообщить о баге.", color=config.danger)
             await intrct.channel.send(embed=embed, view=ticket_launcher.bug())
             client.add_view(ticket_launcher.bug())
         case 'жалобы':
-            embed = discord.Embed(title=title, description=description, color=config.warning)
+            embed = discord.Embed(title="🔏 Подать жалобу или апелляцию.", description="Здесь можно написать жалобу на игрока или админа или написать апелляцию!", color=config.warning)
             await intrct.channel.send(embed=embed, view=ticket_launcher.report())
             client.add_view(ticket_launcher.report())
         case 'заявки':
-            embed = discord.Embed(title=title, description=description, color=config.info)
+            #пиздец олежа что ты сделал
+            embed = discord.Embed(title="👥 Роли", description='**Список ролей Discord сервера!**\n'+
+                            '\n'+
+                            '**Администрация:** \n'+
+                            '> <@&1122089304290762773> - роль владельца сервера \n'+
+                            '> <@&1134198325189562468> - роль большой шишки \n'+
+                            '> <@&1210729205340311622> - роль помощника Совета О5\n'+
+                            '> <@&1134810427889549383> - роль технического администратора \n'+
+                            '> <@&1134177570770911373>, <@&1222560293889249330> - администраторы SCP:SL \n'+
+                            '> <@&1177911300941164674>, <@&1222557997033848974> - модераторы Discord \n'+
+                            '> <@&1123307213000298627> - роль стажёра администрации \n'+
+                            '> <@&1177515135280103504> - роль проводящего ивенты \n'+
+                            '\n'+
+                            '**Люди заслужившие особое внимание:** \n'+
+                            '> <@&1174776209477996574> - роль доверенного администрации \n'+
+                            '> <@&1122546899665293382> - роль начального игрока \n'+
+                            '> <@&1179756967397425273> - роль среднего игрока \n'+
+                            '> <@&1179757460492386355> - роль профессионального игрока \n'+
+                            '\n'+
+                            '**Донатеры:** \n'+
+                            '> <@&1138445633519357954> - роль ультра щедрого человека \n'+
+                            '> <@&1138443741699522571> - роль очень щедрого человека \n'+
+                            '> <@&1138436827909455925> - роль щедрого человека \n'+
+                            '\n'+
+                            '**Роли за уровень:** \n'+
+                            '> <@&1138456995498823781> - роль за 40 уровень Discord \n'+
+                            '> <@&1138456798005842041> - роль за 30 уровень Discord \n'+
+                            '> <@&1138456361202614302> - роль за 20 уровень Discord \n'+
+                            '> <@&1138455999993360444> - роль за 15 уровень Discord \n'+
+                            '> <@&1138455214706393088> - роль за 10 уровень Discord \n'+
+                            '> <@&1138454303409963088> - роль за 3 уровень Discord \n'+
+                            '\n'+
+                            '> **Есть роли, которые тут не написаны. Эти роли либо очень очевидные, по типу <@&1122932414923161660> или же объяснены в другом месте либо же секретные, о предназначении которых вам стоит догадаться самостоятельно!** \n'+
+                            '\n'+
+                            '> **Так же вы можете выбрать ниже интересующую вас заявку.**\n', color=config.info)
             await intrct.channel.send(embed=embed, view=ticket_launcher.application())
             client.add_view(ticket_launcher.application())
-    await interaction.response.defer()
+    await intrct.response.defer()
+    await intrct.delete_original_response()
 
-@tree.command(name="выебать", description="Для MAO", guild=discord.Object(id=config.guild))
-async def sex(intrct):
-    sex_variants = [f'О, да, {intrct.user.display_name}! Выеби меня полностью, {intrct.user.display_name} 💕','Боже мой, как сильно... 💘','Ещеее! Ещееееее! 😍',f'{intrct.user.display_name}, я люблю тебя!']
-    embed = discord.Embed(title = choice(sex_variants),description='', color = config.info)
-    await intrct.response.send_message(embed = embed)
-
-@tree.command(name='сказать', description='Эмбед от имени бота', guild=discord.Object(id=config.guild))
+@tree.command(name='say', description='Эмбед от имени бота', guild=discord.Object(id=config.guild))
 @app_commands.rename(title='заголовок', description='описание', color='цвет')
 @app_commands.describe(title='Заголовок', description='Описание', color='HEX цвет в формате 0x5c5eff')
 async def say(intrct, title: str = None, description: str = None, color: str = '0x5c5eff'):
@@ -235,31 +324,81 @@ async def say(intrct, title: str = None, description: str = None, color: str = '
     else:
         await intrct.response.send_message('У тебя нет прав.', ephemeral=True)
 
-@tree.command(name="8ball", description="Погадаем~", guild=discord.Object(id=config.guild))
-async def magic_ball(intrct):
-    variants = ['Это точно.',
-             'Без сомнения.',
-             'Да, безусловно.',
-             'Вы можете положиться на него.',
-             'На мой взгляд, да.',
-             'Вероятно.',
-             'Перспективы хорошие.',
-             'Да.',
-             'Знаки указывают на да.',
-             'Ответ неясен, попробуйте еще раз.',
-             'Спросите позже.',
-             'Лучше не говорить тебе сейчас.',
-             'Сейчас предсказать невозможно.',
-             'Сосредоточьтесь и спросите еще раз.',
-             'Не рассчитывай на это.',
-             'Мой ответ — нет.',
-             'Мои источники говорят нет.',
-             'Перспективы не очень хорошие.',
-             'Очень сомнительно.']
-    embed = discord.Embed(title = choice(variants), color = config.info)
-    await intrct.response.send_message(embed = embed)
-
-@tree.command(name='дроп', description='Сбросить таблицу', guild=discord.Object(id=config.guild))
+@tree.command(name='правила', guild=discord.Object(id=config.guild))
+async def rules(intrct):
+    embed = discord.Embed(title='📑 Правила сервера Discord', description=str(
+        '1. Запрещено оскорбительное поведение, задевание за живое участников, а также унижение их чести и достоинства, проявление нетерпимости по отношению к тем или иным группам лиц и подогрев конфликтов или участие в них. Это правило не работает в <#1122481071330689045>. При нарушении выдаётся варн.\n\n'+
+        '2. Запрещено размещать сообщения, которые не соответствуют тематике канала, нарушают его локальные правила или неоднократно повторяющиеся или бессмысленные. Это правило не работает в <#1122481071330689045> при условии, что флуд не массовый. При нарушении выдаётся варн.\n\n'+
+        '3. Запрещено пингование других пользователей с целью раздражения. При нарушении выдаётся варн.\n\n'+
+        '4. Запрещено мешать общению в голосовых каналах. К такому относится:\n\n'+
+        '> 4.1 Некачественный звук микрофона, посторонние звуки в фоне, громкая музыка или звуки из других программ мешающие общению. При нарушении сначала будет выдано устное предупреждение, а если человек не слушается, то будет выдан варн.\n'+
+        '> \n'+
+        '> 4.2 Постоянный вход и выход из голосового канала, создающий помехи для других участников. При нарушении сначала будет выдано устное предупреждение, а если человек не слушается, то будет выдан варн.\n\n'+
+        '5. Запрещено размещать контент, который может быть шокирующим, отвратительным, непристойным или опасным для других людей. К такому контенту относятся:\n\n'+
+        '> 5.1 Изображения или видео сексуального характера, а также ролевые игры с сексуальными элементами. Это правило не касается шуток, цитат и выражений, которые имеют другой смысл. При нарушении выдаётся варн.\n'+ 
+        '> \n'+
+        '> 5.2 Политические обсуждения и высказывания ведущие к конфликту и обсуждение современных конфликтов и политик государств или личностей. Так же это касается шовинизма, фашизма и нацизма. При нарушении выдаётся варн.\n'+
+        '> \n'+
+        '> 5.3 Изображения или видео с кровью, мясом, жестокостью или другими отталкивающими сценами. При нарушении выдаётся варн.\n'+
+        '> \n'+
+        '> 5.4 Видео с яркими вспышками, громкими звуками или другими эффектами, которые могут вызвать негативную реакцию у чувствительных людей. При нарушении выдаётся варн.\n'+
+        '> \n'+
+        '> 5.5 Любые материалы, которые подстрекают к незаконным действиям, экстремизму или нанесению вреда себе или другим. При нарушении выдаётся варн.\n\n'+
+        '6. Запрещено размещать сообщения или статус профиля или блоки "Обо мне", которые в каком-либо виде и форме имеют в себе рекламный или агитационный характер с целью привлечь пользователей на посторонние проекты и услуги, а так же товары. При нарушении сначала будет выдано устное предупреждение, если человек не убрал, то будет выдан кик, а если повторится, то бан.\n\n'+
+        '7. Запрещено использование уязвимостей Discord’a и ботов нашего сервера. При нарушении выдаётся варн.\n\n'+
+        '8. Запрещено распространять ложную или ошибочную информацию о проекте с целью оскорбления, провокации или введения в заблуждение других пользователей. При нарушении выдаётся варн.\n\n'+
+        '9. Запрещено выкладывать личную информацию участников сервера без их согласия. При нарушении выдаётся варн.\n\n'+
+        '10. Запрещено вынуждать людей нарушить правила или сливать любую информацию. Правило так же работает в ЛС. При нарушении выдаётся варн.\n\n'+
+        '11. Запрещено участие в нанесении различного рода вреда или ущерба серверу или участникам сервера, а также его организация. При нарушении будет выдан бан навсегда.\n\n'+
+        '12. Запрещено обходить наказание. Это означает, что нельзя создавать новые аккаунты для этой цели или использовать другие способы, чтобы избежать варна, мута, бана или кика. За избегание бана будет выдан бан навсегда, а за избегание варна будет выдан ещё один варн.\n\n'+
+        '**Дополнение: Правила 1, 3, 4, 5 не работают если никто не против их нарушения.** \n\n'+
+        'Наказания за определённое количество варнов:\n'+
+        '> 2 Предупреждение - мут на 1 день\n'+ 
+        '> 3 Предупреждение - мут на 2 дня\n'+ 
+        '> 4 Предупреждение - мут на 7 дней\n'+ 
+        '> 5 и последующее предупреждение - мут на 14 дней\n\n'+
+        'Варны имеют срок в один месяц'), color=config.info)
+    links = discord.Embed(title = '🔬 Правила на GitBook', description = str(
+        '[Правила Classic & Events](https://cyclesite.gitbook.io/wiki/pravila/pravila-classic-and-events)\n'+
+        '[Правила Администрации](https://cyclesite.gitbook.io/wiki/pravila/pravila-administracii)'), color = config.info)
+    await intrct.response.defer()
+    await intrct.channel.send(embeds = [embed, links])
+    await intrct.delete_original_response()
+    
+@tree.command(name='кпп', guild=discord.Object(id=config.guild))
+async def rules(intrct):
+    embed = discord.Embed(title=':wave: Добро пожаловать', description=str(
+        'Привет, новый участник, добро пожаловать на наш проект! Я тебе посоветую сперва ознакомиться с <#1180963320820412476> и ознакомиться с <#1136346930285400154> , а так же пообщаться с другими участниками в <#1122085072577757278>.\n'+
+        '\n'+
+        'Вот объяснение что можно делать в некоторых местах:\n'+
+        '<#1122085072577757278> - здесь можно общаться\n'+
+        '<#1132404679880478751> - здесь можно общаться об играх\n'+
+        '<#1172156034660446248> - здесь можно отсылать сообщения только раз в 6 часов\n'+
+        '<#1122481071330689045> - здесь можно дурачиться и сраться\n'+
+        '<#1130041299693748224> - здесь можно скидывать и смеяться над мемами\n'+
+        '<#1172161486630686751> - здесь можно общаться с ИИ\n'+
+        '<#1123192369630695475> - здесь можно отсылать команды ботам\n'+
+        '<#1172159065040887888> - здесь можно отсылать свои шикарные цитаты\n'+
+        '\n'+
+        'Так же можете ознакомиться с нашим [Wiki](https://cyclesite.gitbook.io/wiki)\n'+
+        '\n'+
+        'Приятного тебе прибывания на нашем проекте!'), color=config.info)
+    links = discord.Embed(title = '💵 Поддержка проекта', description = str(
+        'Так же вы можете поддержать проект на [Boosty](https://boosty.to/cyclicality).\n'+
+        '\n'+
+        'При поддержке проекта от:\n'+
+        '> 200 руб. даётся роль <@&1138436827909455925>\n'+
+        '> 500 руб. даётся роль <@&1138443741699522571>\n'+
+        '> 1000 руб. даётся роль <@&1138445633519357954>\n'+
+        '\n'+
+        'Роль даётся на срок выдачи привилегий. Подробно о донате вы можете узнать на самой странице в Boosty. Так же не забывайте указывать ваш Discord в сообщение к пожертвованию.\n'+
+        '\n'+
+        'За любое количество бустов Discord сервера даётся роль <@&1122867829662814279> и одна привилегия на SCP:SL сервере на выбор. Она даётся на срок буста.(По этому поводу обращайтесь в <#1132616103877673050>)'), color = config.info)
+    await intrct.response.defer()
+    await intrct.channel.send(embeds = [embed, links])
+    await intrct.delete_original_response()
+    
+@tree.command(name='drop', description='Сбросить таблицу', guild=discord.Object(id=config.guild))
 @app_commands.rename(table='таблица')
 async def drop(intrct, table: str):
     if intrct.user.id not in config.bot_engineers:
@@ -268,27 +407,30 @@ async def drop(intrct, table: str):
     embed = discord.Embed(title="Ты точно хочешь сбросить таблицу?", description=f"Будет сброшена таблица {table} у {socket.gethostname()}", color=config.danger)
     await intrct.response.send_message(embed = embed, view = drop_confirm(table, intrct), ephemeral = True, delete_after = 15)
     
-@tree.command(name="варн", description="Выдача предупреждения", guild=discord.Object(id=config.guild))
+@tree.command(name="warn", description="Выдача предупреждения", guild=discord.Object(id=config.guild))
 @app_commands.rename(user='пользователь', reason='причина')
 async def warn(intrct, user: discord.Member, reason: str):
-    connection = sqlite3.connect('data/databases/warns.db')
-    cursor = connection.cursor()
+    #Проверка на адекватность
     if user.id == client.user.id:
         await intrct.response.send_message("Нет.", ephemeral=True)
         return
-    if user.bot == 1:
+    if user.bot:
         await intrct.response.send_message("Ты не можешь выдать предупреждение боту.", ephemeral=True)
         return
     if user == intrct.user:
         await intrct.response.send_message("Попроси кого-нибудь другого.", ephemeral=True)
         return
+
+    await levelling.add_xp(member = user, delta = -1500)
+    connection = sqlite3.connect('data/databases/warns.db')
+    cursor = connection.cursor()
     dt_string = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     cursor.execute('SELECT max(warn_id) FROM warns')
     case_id = cursor.fetchone()[0]
     case_id = 1 if case_id == None else case_id + 1
     embed = discord.Embed(
             title=f"Выдано предупреждение!",
-            description=f'Пользователь {user.mention} получил предупреждение \nID: {case_id}',
+            description=f'Пользователь {user.mention} получил предупреждение \nШтраф опыта: **-1500xp** \nID: **{case_id}**',
             color=config.info
         )
     interaction_author(embed, intrct)
@@ -321,7 +463,7 @@ async def warn(intrct, user: discord.Member, reason: str):
     connection.commit()
     connection.close()
 
-@tree.command(name="список_варнов", description="Помощь", guild=discord.Object(id=config.guild))
+@tree.command(name="listwarns", description="Помощь", guild=discord.Object(id=config.guild))
 @app_commands.rename(user='пользователь')
 async def warns_list(intrct, user: discord.Member = None):
     if not user:
@@ -350,7 +492,7 @@ async def warns_list(intrct, user: discord.Member = None):
     connection.commit()
     connection.close()
 
-@tree.command(name='снять_варн', description='Досрочно снять варн', guild=discord.Object(id=config.guild))
+@tree.command(name='remwarn', description='Досрочно снять варн', guild=discord.Object(id=config.guild))
 @app_commands.rename(warn_id='id')
 async def warn_del(intrct, warn_id: int):
     connection = sqlite3.connect('data/databases/warns.db')
@@ -363,7 +505,7 @@ async def warn_del(intrct, warn_id: int):
     interaction_author(embed, intrct)
     await intrct.response.send_message(embed=embed)
     
-@tree.command(name='аватар', description='Аватар пользователя', guild=discord.Object(id=config.guild))
+@tree.command(name='avatar', description='Аватар пользователя', guild=discord.Object(id=config.guild))
 @app_commands.rename(user='пользователь')
 async def avatar(intrct, user: discord.Member = None):
     if user:
@@ -375,7 +517,7 @@ async def avatar(intrct, user: discord.Member = None):
         embed.set_image(url=intrct.user.display_avatar.url)
         await intrct.response.send_message(embed=embed)
 
-@tree.command(name='сменить_ии', description='Сменить модель ИИ', guild=discord.Object(id=config.guild))
+@tree.command(name='changeai', description='Сменить модель ИИ', guild=discord.Object(id=config.guild))
 @app_commands.rename(model='модель')
 async def change_gpt_model(intrct, model: str):
     if model in fetch_models():
@@ -387,25 +529,127 @@ async def change_gpt_model(intrct, model: str):
         embed = discord.Embed(title='Список доступных моделей:', description='\n'.join(fetch_models()), color=config.info)
         await intrct.response.send_message(embed=embed, ephemeral=True)
 
-@tree.command(name='профиль', description='Профиль', guild=discord.Object(id=config.guild))
+@tree.command(name='ban', description='Унижение человека', guild=discord.Object(id=config.guild))
+@app_commands.rename(user='пользователь')
+async def ban(intrct, user: discord.User):
+    if guild.get_member(user.id):
+        try:
+            await user.remove_roles(*user.roles, atomic=False)
+            await user.add_roles(intrct.guild.get_role(config.banned_role))
+        except discord.app_commands.errors.CommandInvokeError as ex:
+            await intrct.response.send_message(f'**Почему?**', ephemeral=True)
+
+    connection = sqlite3.connect('data/databases/warns.db')
+    cursor = connection.cursor()
+    cursor.execute(f'DELETE FROM bans WHERE id = {user.id}')
+    cursor.execute(f'INSERT INTO bans (id) VALUES ({user.id})')
+    connection.commit()
+    connection.close()
+
+    await intrct.response.send_message(f'**Пользователь был добавлен в чёрный список ✅**', ephemeral=True)
+
+    embed = discord.Embed(description=f'**📕 {user.mention} забанен XD**', color=config.danger)
+    await intrct.guild.get_channel(config.logs_channels.main).send(embed = embed)
+
+@tree.command(name='pardon', description='Унижение человека, но обратно', guild=discord.Object(id=config.guild))
+@app_commands.rename(user='пользователь')
+async def pardon(intrct, user: discord.Member):
+    connection = sqlite3.connect('data/databases/warns.db')
+    cursor = connection.cursor()
+
+    cursor.execute(f'SELECT * FROM bans WHERE id = {user.id}')
+
+    if cursor.fetchone():
+        if guild.get_member(user.id): 
+            await user.remove_roles(intrct.guild.get_role(config.banned_role))
+        cursor.execute(f'DELETE FROM bans WHERE id = {user.id}')
+        embed = discord.Embed(description=f'**📗 {user.mention} разбанен <3**', color=config.success)
+        await intrct.guild.get_channel(config.logs_channels.main).send(embed = embed)
+        await intrct.response.send_message(f'{user.mention} был разбанен.', ephemeral=True)
+    else:
+        await intrct.response.send_message('Этот пользователь не забанен.', ephemeral=True)
+
+    connection.commit()
+    connection.close()
+
+@tree.command(name='profile', description='Профиль', guild=discord.Object(id=config.guild))
 @app_commands.rename(member='пользователь')
 async def user_profile(intrct, member: discord.Member = None):
-    await levelling.user_profile(intrct, member = member)
+    await levelling.user_profile(intrct, member = member if not member == None else intrct.user)
 
-@tree.command(name='лидерборд', description='Топ по активности', guild=discord.Object(id=config.guild))
-@app_commands.rename(lb_type='тип', member='пользователь')
+@tree.command(name='leaderboard', description='Топ по активности', guild=discord.Object(id=config.guild))
+@app_commands.rename(lb_type='сортировать_по')
 @app_commands.choices(lb_type=[
-        app_commands.Choice(name="✨ Опыт дискорда", value="xp"),
-        app_commands.Choice(name="🎤 Время в войсе", value="voice_time"),
-        # app_commands.Choice(name="🎮 Опыт SCP", value="scp"),
+        app_commands.Choice(name="✨ Опыту дискорда", value="xp"),
+        app_commands.Choice(name="🎤 Времени в войсе", value="voice_time"),
+        app_commands.Choice(name="🍕 Пицца", value="pizza"),
+        # app_commands.Choice(name="🎮 Опыту SCP", value="scp"),
         ])
-async def leaderboard(intrct, lb_type: app_commands.Choice[str], member: discord.Member = None):
-    await levelling.leaderboard(intrct, lb_type = lb_type.value, member = member)
+async def leaderboard(intrct, lb_type: app_commands.Choice[str]):
+    await levelling.leaderboard(intrct, lb_type = lb_type)
+
+@tree.command(name='exp', description='Снять/начислить опыт', guild=discord.Object(id=config.guild))
+@app_commands.rename(member='пользователь', delta='дельта')
+async def change_xp(intrct, member: discord.Member, delta: int):
+    new_lvl = await levelling.add_xp(member = member, delta = delta)
+    if new_lvl:
+        new_role = await levelling.update_role(lvl = new_lvl)
+        roles_to_remove = [role for role in member.roles if role.id in config.levelling_roles]
+        await member.remove_roles(*roles_to_remove)
+        await member.add_roles(guild.get_role(new_role)) if new_role else None
+    
+    embed = interaction_author(discord.Embed(description=f'Опыт {member.mention} был изменён на {str(delta)}', color=config.info), intrct)
+    await intrct.response.send_message(embed = embed)
+
+@tree.command(name='steam', description='Синхронизация Steam с Discord', guild=discord.Object(id=config.guild))
+@app_commands.describe(steam='Steam ID / ссылка на профиль / 0 для десинхронизации')
+async def steam_sync(intrct, steam: str):
+    response = await scp_sync.steam_sync(discord_id=str(intrct.user.id), steam=steam)
+    match response[0]:
+        case 200:
+            embed = discord.Embed(title="Привязанный Steam был изменён ✅", color=config.success)
+            embed.add_field(name="Discord", value=str(intrct.user.mention), inline=True)
+            embed.add_field(name="Steam", value=response[2], inline=True)
+        case 201:
+            embed = discord.Embed(title="Steam привязан к Discord ✅", color=config.success)
+            embed.add_field(name="Discord", value=str(intrct.user.mention), inline=True)
+            embed.add_field(name="Steam", value=response[2], inline=True)
+        case 204:
+            embed = discord.Embed(title="Соединение разорвано 🟡", color=config.warning)
+            embed.add_field(name="Discord", value=str(intrct.user.mention), inline=True)
+            embed.add_field(name="Steam", value="Не привязан", inline=True)
+        case 304:
+            embed = discord.Embed(title="Steam уже привязан к этому Discord", color=config.info)
+            embed.add_field(name="Discord", value=str(intrct.user.mention), inline=True)
+            embed.add_field(name="Steam", value=response[2], inline=True)
+        case 409:
+            embed = discord.Embed(title="Steam уже привязан к чужому Discord ❌", description=f"Вы можете обратиться к пользователю или администрации,\nесли это ваш аккаунт", color=config.danger)
+            embed.add_field(name="Discord", value=f'<@{response[1]}>', inline=True)
+            embed.add_field(name="Steam", value=response[2], inline=True)
+        case 500:
+            embed = discord.Embed(title="⚠ Произошла ошибка", color=config.warning)
+    await intrct.response.send_message(embed = embed)
+
+@tree.command(name='steamforced', description='Насильно привязать Steam к аккаунту Discord', guild=discord.Object(id=config.guild))
+async def steam_sync_forced(intrct, discord_id: str, steam_id: str):
+    await scp_sync.steam_sync_forced(discord_id=discord_id, steam_id=steam_id)
+    if steam_id == '0':
+        embed = discord.Embed(title="Steam отвязан успешно 🌐", color=config.info)
+        embed.add_field(name="Discord", value=f'<@{discord_id}>', inline=True)
+        embed.add_field(name="Steam", value='Не привязан', inline=True)
+    else:
+        embed = discord.Embed(title="Аккаунты синхронизированы успешно 🌐", color=config.info)
+        embed.add_field(name="Discord", value=f'<@{discord_id}>', inline=True)
+        embed.add_field(name="Steam", value=steam_id, inline=True)
+    await intrct.response.send_message(embed = embed)
+
+
+#События
 
 @client.event
 async def on_message_delete(message):
 
-    if message.author == client.user:
+    if message.author.bot:
         return
 
     attachments = ''
@@ -420,15 +664,18 @@ async def on_message_delete(message):
     embed.set_author(name=str(message.author), icon_url=str(message.author.display_avatar))
     embed.add_field(name="Отправитель", value=str(message.author.mention), inline=False)
     if message.content != '':
-        embed.add_field(name="Сообщение", value=str(f"```{message.content}```" + attachments), inline=False)
+        if len(message.content) > 1024:
+            embed.add_field(name="Сообщение", value=str(f"```{message.content[:1010]}...```" + attachments), inline=False)
+        else:
+            embed.add_field(name="Сообщение", value=str(f"```{message.content}```" + attachments), inline=False)
     elif attachments != '':
         embed.add_field(name="Вложения", value=str(attachments), inline=False)
     embed.add_field(name="Канал", value=str(message.channel.mention), inline=False)
 
     if message.channel.category_id in config.very_secret_categories:
-        await client.get_guild(config.guild).get_channel(config.logs_channels.private).send(embed = embed)
+        await guild.get_channel(config.logs_channels.private).send(embed = embed)
     else:
-        await client.get_guild(config.guild).get_channel(config.logs_channels.main).send(embed = embed)
+        await guild.get_channel(config.logs_channels.main).send(embed = embed)
 
 @client.event
 async def on_message_edit(message_before, message_after):
@@ -437,44 +684,63 @@ async def on_message_edit(message_before, message_after):
         embed = discord.Embed(title='✏️ Сообщение Отредактировано', color=config.info)
         embed.set_author(name=str(message_before.author), icon_url=str(message_before.author.display_avatar))
         embed.add_field(name="Отправитель", value=str(message_before.author.mention), inline=False)
-        embed.add_field(name="До", value=str(f"```{message_before.content}```"), inline=False)
-        embed.add_field(name="После", value=str(f"```{message_after.content}```"), inline=False)
+        if len(message_before.content) > 1024:
+            embed.add_field(name="До", value=str(f"```{message_after.content[:1010]}...```"), inline=False)
+        else:
+            embed.add_field(name="До", value=str(f"```{message_before.content}```"), inline=False)
+        if len(message_after.content) > 1024:
+            embed.add_field(name="После", value=str(f"```{message_after.content[:1010]}...```"), inline=False)
+        else:
+            embed.add_field(name="После", value=str(f"```{message_after.content}```"), inline=False)
         embed.add_field(name="Канал", value=str(message_after.channel.mention), inline=False)
 
         if message_after.channel.category_id in config.very_secret_categories:
-            await client.get_guild(config.guild).get_channel(config.logs_channels.private).send(embed = embed)
+            await guild.get_channel(config.logs_channels.private).send(embed = embed)
         else:
-            await client.get_guild(config.guild).get_channel(config.logs_channels.main).send(embed = embed)
+            await guild.get_channel(config.logs_channels.main).send(embed = embed)
 
 @client.event
 async def on_voice_state_update(member, state_before, state_after):
     #Логи
     voice_channel_before = state_before.channel
     voice_channel_after = state_after.channel
-
-    if voice_channel_before == voice_channel_after:
-        return
     
     if voice_channel_before == None:
         embed = discord.Embed(description=f'{member.mention} **присоединился к {voice_channel_after.mention}**', color=config.info)
         embed.set_author(name=member.display_name, icon_url=str(member.display_avatar))
-        in_voice.update({member: datetime.now()})
+        await guild.get_channel(config.logs_channels.voice).send(embed = embed)
+
+        if not state_after.self_mute: 
+            in_voice.update({member: datetime.now()})
 
     elif voice_channel_after == None:
         embed = discord.Embed(description=f'{member.mention} **вышел из {voice_channel_before.mention}**', color=config.info)
         embed.set_author(name=member.display_name, icon_url=str(member.display_avatar))
-        try:
-            timedelta = (datetime.now() - in_voice.get(member)).total_seconds()
-            await levelling.xp_on_voice(member, timedelta)
-        except TypeError as exception:
-            pass
+        await guild.get_channel(config.logs_channels.voice).send(embed = embed)
 
-    else:
+        if in_voice.get(member) != None and not state_before.self_mute and voice_channel_before.id != 1132601091238924349:
+            timedelta = (datetime.now() - in_voice.get(member)).total_seconds()
+            new_role = await levelling.xp_on_voice(member, timedelta)
+            if new_role:
+                    roles_to_remove = [role for role in member.roles if role.id in config.levelling_roles]
+                    await member.remove_roles(*roles_to_remove)
+                    await member.add_roles(guild.get_role(int(new_role)))
+    
+    elif voice_channel_after != voice_channel_before:
         embed = discord.Embed(description=f'{member.mention} **перешел из {voice_channel_before.mention} в {voice_channel_after.mention}**', color=config.info)
         embed.set_author(name=member.display_name, icon_url=str(member.display_avatar))
+        await guild.get_channel(config.logs_channels.voice).send(embed = embed)
+        
+    elif state_after.self_mute and not state_before.self_mute and in_voice.get(member) != None:
+        timedelta = (datetime.now() - in_voice.get(member)).total_seconds()
+        new_role = await levelling.xp_on_voice(member, timedelta)
+        if new_role:
+                roles_to_remove = [role for role in member.roles if role.id in config.levelling_roles]
+                await member.remove_roles(*roles_to_remove)
+                await member.add_roles(guild.get_role(int(new_role)))
     
-    await client.get_guild(config.guild).get_channel(config.logs_channels.voice).send(embed = embed)
-
+    elif state_before.self_mute and not state_after.self_mute:
+        in_voice.update({member: datetime.now()})
 
 @client.event
 async def on_member_join(member):
@@ -482,7 +748,12 @@ async def on_member_join(member):
         embed.add_field(name="Дата регистрации", value=f'<t:{unix_datetime(member.created_at)}:f>', inline=False)
         embed.set_thumbnail(url = str(member.display_avatar))
         
-        await client.get_guild(config.guild).get_channel(config.logs_channels.main).send(embed = embed)
+        await guild.get_channel(config.logs_channels.main).send(embed = embed)
+
+        if await check_ban(member):
+            await member.add_roles(member.guild.get_role(config.banned_role))
+            embed = discord.Embed(title=f'**📕 {member.mention} забанен нахуй**', color=config.danger)
+            await guild.get_channel(config.logs_channels.main).send(embed = embed)
 
 @client.event
 async def on_member_remove(member):
@@ -490,6 +761,6 @@ async def on_member_remove(member):
         embed.add_field(name="Дата присоединения", value=f'<t:{unix_datetime(member.joined_at)}:f>', inline=False)
         embed.set_thumbnail(url = str(member.display_avatar))
 
-        await client.get_guild(config.guild).get_channel(config.logs_channels.main).send(embed = embed)
+        await guild.get_channel(config.logs_channels.main).send(embed = embed)
 
 client.run(config.token)
